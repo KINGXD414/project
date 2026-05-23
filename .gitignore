@@ -1,0 +1,26 @@
+# 编译产物
+*.o
+*.obj
+*.exe
+*.a
+*.so
+*.out
+*.log
+build/
+cmake-build-*/
+bin/
+lib/
+
+# IDE配置文件
+.vscode/
+.idea/
+*.user
+.vs/
+*.sln
+*.vcxproj
+
+# 临时文件
+*.tmp
+*.swp
+*~
+.DS_Store
