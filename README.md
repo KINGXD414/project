@@ -1,9 +1,9 @@
-# project
-a project
-# MuduoChatServer 分布式高并发聊天服务器
+# distro-reactor-chat
+a distro-reactor-chat
+# 基于Reactor的高并发分布及时通讯系统
 
 ## 项目介绍
-MuduoChatServer 是基于 C++ Muduo 网络库开发的高性能即时通讯服务器，支持用户注册登录、一对一聊天、好友管理、群组创建与群聊、离线消息存储、分布式消息转发等完整 IM 功能。
+基于 C++ Muduo 网络库开发的高性能即时通讯服务器，支持用户注册登录、一对一聊天、好友管理、群组创建与群聊、离线消息存储、分布式消息转发等完整 IM 功能。
 
 项目使用 MySQL 做数据持久化，Redis 实现跨服务器消息同步，全程在 VSCode 中开发，并提供一键编译脚本 autobuild.sh，适合学习、面试、毕业设计使用。
 
