@@ -148,70 +148,165 @@ Sender 发消息
 
 ## 编译运行
 
-### 1. 编译
+### 0. 环境准备
+
+```bash
+# 安装 MySQL 8.0
+sudo apt install mysql-server
+sudo mysql_secure_installation
+
+# 安装 Redis
+sudo apt install redis-server
+
+# 安装 Nginx（需支持 stream 模块，1.9.0+）
+sudo apt install nginx
+
+# 安装编译依赖
+sudo apt install g++ cmake make libmuduo-dev libmysqlclient-dev libhiredis-dev
+```
+
+### 1. 初始化数据库
+
+```bash
+# 登录 MySQL
+sudo mysql -u root -p
+
+# 创建数据库和表
+CREATE DATABASE chat DEFAULT CHARACTER SET utf8mb4;
+
+CREATE TABLE user (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    name VARCHAR(50) UNIQUE NOT NULL,
+    pwd VARCHAR(50) NOT NULL,
+    state INT DEFAULT 0
+);
+
+CREATE TABLE friend (
+    userid INT,
+    friendid INT,
+    PRIMARY KEY (userid, friendid)
+);
+
+CREATE TABLE `group` (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    groupname VARCHAR(50) NOT NULL,
+    groupdesc VARCHAR(200) DEFAULT ''
+);
+
+CREATE TABLE groupuser (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    groupid INT,
+    userid INT,
+    grouprole VARCHAR(20) DEFAULT 'member'
+);
+
+CREATE TABLE offlinemessage (
+    userid INT,
+    message VARCHAR(2000)
+);
+
+EXIT;
+```
+
+> **清空测试数据**（数据乱了想重来）：
+> ```bash
+> mysql -u root -p123456 chat -e "TRUNCATE offlinemessage; TRUNCATE groupuser; TRUNCATE friend; TRUNCATE \`group\`; TRUNCATE user;"
+> ```
+
+### 2. 确保 MySQL 和 Redis 在运行
+
+```bash
+sudo systemctl start mysql
+sudo systemctl start redis-server
+
+# 验证
+sudo systemctl status mysql
+redis-cli ping   # 应返回 PONG
+```
+
+### 3. 编译
 
 ```bash
 chmod +x autobuild.sh
 ./autobuild.sh
 ```
 
-### 2. 启动后端集群
+编译产物在 `bin/` 目录下：`ChatServer`/`ChatClient`/`ChatBench`/`ConnBench`。
+
+### 4. 启动服务端
+
+**方式 A：单实例（开发调试最常用）**
 
 ```bash
-# 方式A: 单实例（开发调试）
 cd bin
 ./ChatServer 127.0.0.1 6000
 
-# 方式B: 集群管理脚本（推荐）
+# 无线程池模式（对比性能用）
+./ChatServer 127.0.0.1 6000 --no-pool
+```
+
+**方式 B：集群管理脚本（推荐）**
+
+```bash
 chmod +x cluster.sh
-./cluster.sh start        # 启动 3 节点 + 自动更新 Nginx
-./cluster.sh start 5      # 启动 5 节点
-./cluster.sh start 3 7000 # 3 节点，从 7000 端口开始
-./cluster.sh status       # 查看集群状态
-./cluster.sh add 6005     # 热添加节点（自动更新 Nginx upstream）
-./cluster.sh del 6001     # 热移除节点（自动更新 Nginx upstream）
-./cluster.sh stop         # 停止全部
-
-# 方式C: 手动启动（不依赖 Nginx）
-./ChatServer 0.0.0.0 6000 &
-./ChatServer 0.0.0.0 6001 &
-./ChatServer 0.0.0.0 6002 &
+./cluster.sh start          # 启动 3 节点（6000/6001/6002）+ 自动更新 Nginx
+./cluster.sh start 5        # 启动 5 节点
+./cluster.sh start 3 7000   # 3 节点，从 7000 端口开始
+./cluster.sh status         # 查看集群状态
+./cluster.sh add 6003       # 热添加节点
+./cluster.sh del 6001       # 热移除节点
+./cluster.sh stop           # 停止全部
 ```
 
-### 3. 启动 Nginx 负载均衡（可选）
+**方式 C：手动启动多实例（不用脚本）**
 
 ```bash
-# 安装 Nginx（需支持 stream 模块，1.9.0+）
-sudo apt install nginx
-
-# 使用项目配置
-sudo nginx -c /path/to/MuduoChatServer/nginx.conf
-
-# 或追加到系统配置
-# sudo cp nginx.conf /etc/nginx/stream.conf
-# 在 /etc/nginx/nginx.conf 中: include /etc/nginx/stream.conf;
+./bin/ChatServer 127.0.0.1 6000 &
+./bin/ChatServer 127.0.0.1 6001 &
+./bin/ChatServer 127.0.0.1 6002 &
 ```
 
-### 4. 客户端连接
+### 5. 启动 Nginx 负载均衡（集群部署时需要）
 
 ```bash
-# 直连单实例
-./ChatClient 127.0.0.1 6000
+# 停掉旧 Nginx（如果有）
+sudo nginx -s quit 2>/dev/null
 
-# 通过 Nginx 负载均衡（推荐）
-./ChatClient 127.0.0.1 8000
+# 使用项目配置启动
+sudo nginx -c $(pwd)/nginx.conf
+
+# 重载配置（修改 nginx.conf 后）
+sudo nginx -s reload
+
+# 验证监听
+sudo ss -tlnp | grep 8000
 ```
 
-### 5. 压测
+> 如果报 `unknown directive "stream"`：确认 `/etc/nginx/modules-enabled/` 下有 `mod-stream.conf`。没有则执行 `sudo apt install libnginx-mod-stream`。
+
+### 6. 客户端连接
 
 ```bash
+# 直连单实例（开发调试）
+./bin/ChatClient 127.0.0.1 6000
+
+# 通过 Nginx 负载均衡（集群部署，推荐）
+./bin/ChatClient 127.0.0.1 8000
+```
+
+### 7. 压测
+
+```bash
+# 先启动服务端
+./bin/ChatServer 127.0.0.1 6000 &
+
 # 全维度压测（登录梯度/注册/聊天/线程池A/B/浸泡）
 ./run_all_tests.sh
 
 # 单独浸泡测试（5分钟，检测内存/句柄泄露）
 ./soak_test.sh
 
-# ChatBench 命令行（手动调参）
+# ChatBench 手动调参
 ./bin/ChatBench --ip 127.0.0.1 --port 6000 --scenario login --concurrency 100 --total 500
 ```
 
