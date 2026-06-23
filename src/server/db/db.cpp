@@ -1,68 +1,95 @@
 #include "db.h"
+#include "connectionpool.hpp"
 #include <muduo/base/Logging.h>
+#include <vector>
 using namespace std;
 
-// 数据库配置信息
 static string server = "127.0.0.1";
-string user = "chat";
+string user = "root";
 string password = "123456";
 string dbname = "chat";
-// 初始化数据库连接
+
 MySQL::MySQL()
+    : _conn(nullptr), _fromPool(false)
 {
-    _conn = mysql_init(nullptr);
 }
-// 释放数据库连接资源这里用UserModel示例，通过UserModel如何对业务层封装底层数据库的操作
+
 MySQL::~MySQL()
 {
     if (_conn != nullptr)
-        mysql_close(_conn);
+    {
+        if (_fromPool)
+        {
+            ConnectionPool::instance()->release(_conn);
+        }
+        else
+        {
+            mysql_close(_conn);
+        }
+        _conn = nullptr;
+    }
 }
 
-// 连接数据库
 bool MySQL::connect()
 {
+    // 优先从连接池获取（不阻塞等待，避免 IO 线程饥饿）
+    _conn = ConnectionPool::instance()->acquire(0);
+    if (_conn != nullptr)
+    {
+        _fromPool = true;
+        return true;
+    }
+
+    // Fallback: 直接创建新连接
+    _conn = mysql_init(nullptr);
     MYSQL *p = mysql_real_connect(_conn, server.c_str(), user.c_str(),
                                   password.c_str(), dbname.c_str(), 3306, nullptr, 0);
     if (p != nullptr)
     {
-        // C和C++代码默认的编码字符是ASCII，如果不设置，从MySQL上拉下来的中文显示
         mysql_query(_conn, "set names utf8mb4");
-        LOG_INFO << "connect mysql success!";
+        _fromPool = false;
     }
     else
     {
-        LOG_INFO << "connect mysql fail!";
-    }
-    return p;
-}
-
-// 更新操作
-bool MySQL::update(string sql)
-{
-    if (mysql_query(_conn, sql.c_str()))
-    {
-        LOG_INFO << __FILE__ << ":" << __LINE__ << ":"
-                 << sql << "更新失败!";
+        LOG_ERROR << "connect mysql fail!";
+        mysql_close(_conn);
+        _conn = nullptr;
         return false;
     }
     return true;
 }
 
-// 查询操作
+bool MySQL::update(string sql)
+{
+    if (mysql_query(_conn, sql.c_str()))
+    {
+        LOG_ERROR << __FILE__ << ":" << __LINE__ << ":" << sql << " 更新失败!";
+        return false;
+    }
+    return true;
+}
+
 MYSQL_RES *MySQL::query(string sql)
 {
     if (mysql_query(_conn, sql.c_str()))
     {
-        LOG_INFO << __FILE__ << ":" << __LINE__ << ":"
-                 << sql << "查询失败!";
+        LOG_ERROR << __FILE__ << ":" << __LINE__ << ":" << sql << " 查询失败!";
         return nullptr;
     }
-    return mysql_use_result(_conn);
+    // 改用 mysql_store_result：一次性将结果集从服务端全部取到客户端内存
+    // 避免 mysql_use_result 因未取完行导致的 "Commands out of sync" 错误
+    return mysql_store_result(_conn);
 }
 
-// 获取连接
-MYSQL* MySQL::getConnection()
+MYSQL *MySQL::getConnection()
 {
     return _conn;
+}
+
+string MySQL::escape(const string &str)
+{
+    if (_conn == nullptr) return str;
+    vector<char> buf(str.size() * 2 + 1);
+    mysql_real_escape_string(_conn, buf.data(), str.c_str(), str.size());
+    return string(buf.data());
 }

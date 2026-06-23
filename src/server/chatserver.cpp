@@ -1,58 +1,94 @@
 #include "chatserver.hpp"
 #include "chatservice.hpp"
+#include "protocol.hpp"
 #include "json.hpp"
-
-#include <functional> //绑定器
+#include <functional>
 #include <string>
+#include "muduo/base/Logging.h"
 using namespace std;
 using namespace placeholders;
-using json=nlohmann::json;
+using json = nlohmann::json;
 
-// 初始化聊天服务器对象
-ChatServer::ChatServer(EventLoop *loop,               // 事件循环
-                       const InetAddress &listenAddr, // IP+Port
-                       const string &nameArg)         // 服务器的名字
+ChatServer::ChatServer(EventLoop *loop,
+                       const InetAddress &listenAddr,
+                       const string &nameArg)
     : _server(loop, listenAddr, nameArg), _loop(loop)
 {
-    // 注册链接回调
-    _server.setConnectionCallback(std::bind(&ChatServer::onConnection, this, _1)); //_1参数占位符，命名空间placeholders,onConnection只有一个参数
-
-    // 注册消息回调
-    _server.setMessageCallback(std::bind(&ChatServer::onMessage, this, _1, _2, _3)); //_1,_2,_3，onMessage有3个参数
-
-    // 设置线程数量
+    _server.setConnectionCallback(std::bind(&ChatServer::onConnection, this, _1));
+    _server.setMessageCallback(std::bind(&ChatServer::onMessage, this, _1, _2, _3));
     _server.setThreadNum(4);
 }
 
-// 启动服务
 void ChatServer::start()
 {
     _server.start();
 }
 
-// 上报链接相关信息的回调函数
 void ChatServer::onConnection(const TcpConnectionPtr &conn)
 {
-    //客户端断开连接
-    if(!conn->connected())
+    if (!conn->connected())
     {
         ChatService::instance()->clientCloseException(conn);
         conn->shutdown();
     }
 }
-// 上报读写事件信息相关的回调函数
-void ChatServer::onMessage(const TcpConnectionPtr &conn, // 连接
-                           Buffer *buffer,               // 缓冲区
-                           Timestamp time)               // 接收到数据的时间信息
-{
-    string buf=buffer->retrieveAllAsString();
-    //数据的反序列化
-    json js=json::parse(buf);
 
-    //达到的目的：完全解耦网络模块的代码和业务模块的代码
-    //通过js["msgid"]获取=》业务handler(处理器)=》 conn  js  time
-    //获取服务的唯一实例，获取消息id所对应的消息处理器
-    auto msgHandler = ChatService::instance()->getHandler(js["msgid"].get<int>());//js["msgid"].get<int>(),将js["msgid"]键值强转成int类型
-    //回调消息绑定好的事件处理器，来执行相应的业务处理
-    msgHandler(conn,js,time);
+void ChatServer::onMessage(const TcpConnectionPtr &conn, Buffer *buf, Timestamp time)
+{
+    // 长度前缀帧协议: 4字节长度(大端) + 消息体
+    // 时间复杂度 O(1)，无需扫描缓冲区找分隔符
+    while (buf->readableBytes() >= 4)
+    {
+        // 读取4字节长度头（网络字节序 → 主机字节序）
+        uint32_t len = buf->peekInt32();
+
+        // 长度合法性检查：拒绝超大或损坏的报文
+        if (len > kMaxMessageSize)
+        {
+            LOG_ERROR << "Message too large: " << len << " bytes, closing connection";
+            conn->shutdown();
+            return;
+        }
+
+        // 检查完整消息是否已到达
+        if (buf->readableBytes() < 4 + len)
+            break;  // 数据不完整，等待更多数据到来
+
+        // 跳过长度头，取出消息体
+        buf->retrieve(4);
+        std::string msg(buf->peek(), len);
+        buf->retrieve(len);
+
+        processMessage(conn, msg, time);
+    }
+}
+
+void ChatServer::processMessage(const TcpConnectionPtr &conn, const string &msg, Timestamp time)
+{
+    try
+    {
+        json js = json::parse(msg);
+        if (!js.contains("msgid"))
+        {
+            LOG_ERROR << "JSON missing msgid";
+            return;
+        }
+        int msgid = js["msgid"].get<int>();
+        auto handler = ChatService::instance()->getHandler(msgid);
+        if (handler)
+        {
+            // 深拷贝，确保handler拿到的json不会被外部修改
+            string msg_data = js.dump();
+            json safe_js = json::parse(msg_data);
+            handler(conn, safe_js, time);
+        }
+        else
+        {
+            LOG_ERROR << "No handler for msgid: " << msgid;
+        }
+    }
+    catch (const std::exception &e)
+    {
+        LOG_ERROR << "Parse error: " << e.what() << ", raw: [" << msg << "]";
+    }
 }

@@ -1,4 +1,5 @@
 #include "json.hpp"
+#include "protocol.hpp"
 #include <iostream>
 #include <thread>
 #include <string>
@@ -148,7 +149,7 @@ int main(int argc, char **argv)
 
             g_isLoginSuccess = false;
 
-            int len = send(clientfd, request.c_str(), strlen(request.c_str()) + 1, 0);
+            int len = sendWithLength(clientfd, request);
             if (len == -1)
             {
                 cerr << "send login msg error:" << request << endl;
@@ -183,7 +184,7 @@ int main(int argc, char **argv)
             js["password"] = pwd;
             string request = js.dump();
 
-            int len = send(clientfd, request.c_str(), strlen(request.c_str()) + 1, 0);
+            int len = sendWithLength(clientfd, request);
             if (len == -1)
             {
                 cerr << "send reg msg error:" << request << endl;
@@ -310,22 +311,21 @@ void doLoginResponse(json &responsejs)
     }
 }
 
-// 子线程 - 专门处理接收服务器消息
+// 子线程 - 专门处理接收服务器消息（长度前缀帧协议）
 void readTaskHandler(int clientfd)
 {
     for (;;)
     {
-        char buffer[1024] = {0};
-        // 阻塞等待接收服务器数据
-        int len = recv(clientfd, buffer, 1024, 0);
-        if (-1 == len || 0 == len)
+        // 按长度前缀帧协议接收: 4字节头 + 消息体，自动处理粘包/半包
+        string msg;
+        if (!recvWithLength(clientfd, msg))
         {
             close(clientfd);
             exit(-1);
         }
 
         // 反序列化JSON
-        json js = json::parse(buffer);
+        json js = json::parse(msg);
         int msgtype = js["msgid"].get<int>();
 
         // 一对一聊天消息
@@ -333,6 +333,16 @@ void readTaskHandler(int clientfd)
         {
             cout << js["time"].get<string>() << " [" << js["id"] << "]" << js["name"].get<string>()
                  << " said: " << js["msg"].get<string>() << endl;
+
+            // ====== Store-then-Deliver: 发送 ACK 确认 ======
+            if (js.contains("msg_uuid"))
+            {
+                json ack;
+                ack["msgid"] = ONE_CHAT_MSG_ACK;
+                ack["id"] = g_currentUser.getId();
+                ack["msg_uuid"] = js["msg_uuid"].get<string>();
+                sendWithLength(clientfd, ack.dump());
+            }
             continue;
         }
 
@@ -341,6 +351,16 @@ void readTaskHandler(int clientfd)
         {
             cout << "群消息[" << js["groupid"] << "]:" << js["time"].get<string>() << " [" << js["id"] << "]" << js["name"].get<string>()
                  << " said: " << js["msg"].get<string>() << endl;
+
+            // ====== Store-then-Deliver: 发送 ACK 确认 ======
+            if (js.contains("msg_uuid"))
+            {
+                json ack;
+                ack["msgid"] = GROUP_CHAT_MSG_ACK;
+                ack["id"] = g_currentUser.getId();
+                ack["msg_uuid"] = js["msg_uuid"].get<string>();
+                sendWithLength(clientfd, ack.dump());
+            }
             continue;
         }
 
@@ -475,7 +495,7 @@ void addfriend(int clientfd, string str)
     js["friendid"] = friendid;
     string buffer = js.dump();
 
-    int len = send(clientfd, buffer.c_str(), strlen(buffer.c_str()) + 1, 0);
+    int len = sendWithLength(clientfd, buffer);
     if (-1 == len)
     {
         cerr << "send addfriend msg error -> " << buffer << endl;
@@ -504,7 +524,7 @@ void chat(int clientfd, string str)
     js["time"] = getCurrentTime();
     string buffer = js.dump();
 
-    int len = send(clientfd, buffer.c_str(), strlen(buffer.c_str()) + 1, 0);
+    int len = sendWithLength(clientfd, buffer);
     if (-1 == len)
     {
         cerr << "send chat msg error -> " << buffer << endl;
@@ -531,7 +551,7 @@ void creategroup(int clientfd, string str)
     js["groupdesc"] = groupdesc;
     string buffer = js.dump();
 
-    int len = send(clientfd, buffer.c_str(), strlen(buffer.c_str()) + 1, 0);
+    int len = sendWithLength(clientfd, buffer);
     if (-1 == len)
     {
         cerr << "send creategroup msg error -> " << buffer << endl;
@@ -548,7 +568,7 @@ void addgroup(int clientfd, string str)
     js["groupid"] = groupid;
     string buffer = js.dump();
 
-    int len = send(clientfd, buffer.c_str(), strlen(buffer.c_str()) + 1, 0);
+    int len = sendWithLength(clientfd, buffer);
     if (-1 == len)
     {
         cerr << "send addgroup msg error -> " << buffer << endl;
@@ -577,7 +597,7 @@ void groupchat(int clientfd, string str)
     js["time"] = getCurrentTime();
     string buffer = js.dump();
 
-    int len = send(clientfd, buffer.c_str(), strlen(buffer.c_str()) + 1, 0);
+    int len = sendWithLength(clientfd, buffer);
     if (-1 == len)
     {
         cerr << "send groupchat msg error -> " << buffer << endl;
@@ -592,7 +612,7 @@ void loginout(int clientfd, string)
     js["id"] = g_currentUser.getId();
     string buffer = js.dump();
 
-    int len = send(clientfd, buffer.c_str(), strlen(buffer.c_str()) + 1, 0);
+    int len = sendWithLength(clientfd, buffer);
     if (-1 == len)
     {
         cerr << "send loginout msg error -> " << buffer << endl;

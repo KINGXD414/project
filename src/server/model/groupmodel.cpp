@@ -1,59 +1,51 @@
 #include "groupmodel.hpp"
 #include "db.h"
-#include <string>
+#include <muduo/base/Logging.h>
 
-// 创建群组
+// group表: id(int,PRI,auto_increment) groupname(varchar(50)) groupdesc(varchar(200))
+// groupuser表: id(int,PRI,auto_increment) groupid(int) userid(int) grouprole(varchar(20),default "member")
+
 bool GroupModel::creatGroup(Group &group)
 {
-    // 转义单引号，彻底解决更新失败！
-    string name = group.getName();
-    string desc = group.getDesc();
-    size_t pos = 0;
-    while ((pos = name.find("'", pos)) != string::npos) {
-        name.insert(pos, "'");
-        pos += 2;
-    }
-    pos = 0;
-    while ((pos = desc.find("'", pos)) != string::npos) {
-        desc.insert(pos, "'");
-        pos += 2;
-    }
+    MySQL mysql;
+    if (!mysql.connect()) return false;
 
     char sql[1024] = {0};
-    sprintf(sql, "insert into `group`(groupname, groupdesc) values('%s','%s')",
-            name.c_str(), desc.c_str());
+    sprintf(sql, "insert into `group`(groupname, groupdesc) values('%s', '%s')",
+            mysql.escape(group.getName()).c_str(),
+            mysql.escape(group.getDesc()).c_str());
 
-    MySQL mysql;
-    if (mysql.connect())
+    if (mysql.update(sql))
     {
-        if (mysql.update(sql))
-        {
-            group.setId(mysql_insert_id(mysql.getConnection()));
-            return true;
-        }
+        // 获取自增的群ID
+        group.setId(mysql_insert_id(mysql.getConnection()));
+        return true;
     }
     return false;
 }
 
-// 加入群组
 void GroupModel::addGroup(int userid, int groupid, string role)
 {
-    char sql[1024] = {0};
-    sprintf(sql, "insert into groupuser(groupid, userid, grouprole) values(%d,%d,'%s')", groupid, userid, role.c_str());
-
     MySQL mysql;
-    if (mysql.connect())
-    {
-        mysql.update(sql);
-    }
+    if (!mysql.connect()) return;
+
+    char sql[1024] = {0};
+    sprintf(sql, "insert into groupuser(groupid, userid, grouprole) values(%d, %d, '%s')",
+            groupid, userid, mysql.escape(role).c_str());
+
+    mysql.update(sql);
 }
 
-// 查询用户所在群组信息
+// ★ 查询用户所在群组，必须包含群组成员列表（含role）
+// 客户端doLoginResponse期望每个group有 "users" 字段，每个user有 id/name/state/role
 vector<Group> GroupModel::queryGroups(int userid)
 {
+    // 1. 查用户所在的所有群组
     char sql[1024] = {0};
-    sprintf(sql, "select a.id,a.groupname,a.groupdesc from `group` a inner join groupuser b on a.id = b.groupid where b.userid=%d",
-            userid);
+    sprintf(sql,
+        "select a.id, a.groupname, a.groupdesc from `group` a "
+        "inner join groupuser b on a.id = b.groupid where b.userid = %d",
+        userid);
 
     vector<Group> groupVec;
     MySQL mysql;
@@ -74,35 +66,47 @@ vector<Group> GroupModel::queryGroups(int userid)
             mysql_free_result(res);
         }
     }
+
+    // 2. 对每个群组，查询其所有成员（join user+groupuser，拿到id/name/state/role）
     for (Group &group : groupVec)
     {
-        sprintf(sql, "select a.id,a.name,a.state,b.grouprole from user a inner join groupuser b on a.id = b.userid where b.groupid=%d",
-                group.getId());
-        MYSQL_RES *res = mysql.query(sql);
-        if (res != nullptr)
+        char sql2[1024] = {0};
+        sprintf(sql2,
+            "select a.id, a.name, a.state, b.grouprole from user a "
+            "inner join groupuser b on a.id = b.userid where b.groupid = %d",
+            group.getId());
+
+        if (mysql.connect())
         {
-            MYSQL_ROW row;
-            while ((row = mysql_fetch_row(res)) != nullptr)
+            MYSQL_RES *res = mysql.query(sql2);
+            if (res != nullptr)
             {
-                GroupUser user;
-                user.setId(atoi(row[0]));
-                user.setName(row[1]);
-                user.setState(row[2]);
-                user.setRole(row[3]);
-                group.getUsers().push_back(user);
+                MYSQL_ROW row;
+                while ((row = mysql_fetch_row(res)) != nullptr)
+                {
+                    GroupUser user;
+                    user.setId(atoi(row[0]));
+                    user.setName(row[1]);
+                    // ★ 数据库state是int，映射为string
+                    user.setState(atoi(row[2]) == 1 ? "online" : "offline");
+                    user.setRole(row[3]);
+                    group.getUsers().push_back(user);
+                }
+                mysql_free_result(res);
             }
-            mysql_free_result(res);
         }
     }
+
     return groupVec;
 }
 
 vector<int> GroupModel::queryGroupUsers(int userid, int groupid)
 {
     char sql[1024] = {0};
-    sprintf(sql, "select userid from groupuser where groupid= %d and userid!=%d", groupid, userid);
+    sprintf(sql, "select userid from groupuser where groupid = %d and userid != %d",
+            groupid, userid);
 
-    vector<int> idVec;
+    vector<int> vec;
     MySQL mysql;
     if (mysql.connect())
     {
@@ -112,10 +116,10 @@ vector<int> GroupModel::queryGroupUsers(int userid, int groupid)
             MYSQL_ROW row;
             while ((row = mysql_fetch_row(res)) != nullptr)
             {
-                idVec.push_back(atoi(row[0]));
+                vec.push_back(atoi(row[0]));
             }
             mysql_free_result(res);
         }
     }
-    return idVec;
+    return vec;
 }

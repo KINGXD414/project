@@ -13,7 +13,7 @@ public:
     MySQL();
     // 释放数据库连接资源
     ~MySQL();
-    // 连接数据库
+    // 连接数据库（优先从连接池获取）
     bool connect();
     // 更新操作
     bool update(string sql);
@@ -24,8 +24,12 @@ public:
     //获取连接
     MYSQL* getConnection();
 
+    // SQL 字符串转义（防注入）
+    string escape(const string &str);
+
 private:
     MYSQL *_conn;
+    bool _fromPool;  // 标记连接是否来自连接池
 };
 
 #endif

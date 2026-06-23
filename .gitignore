@@ -19,6 +19,9 @@ lib/
 *.sln
 *.vcxproj
 
+# 面试文档（不提交）
+RESUME.md
+
 # 临时文件
 *.tmp
 *.swp

@@ -10,19 +10,13 @@ Redis::Redis()
 Redis::~Redis()
 {
     if (_publish_context != nullptr)
-    {
         redisFree(_publish_context);
-    }
-
     if (_subcribe_context != nullptr)
-    {
         redisFree(_subcribe_context);
-    }
 }
 
 bool Redis::connect()
 {
-    // 负责publish发布消息的上下文连接
     _publish_context = redisConnect("127.0.0.1", 6379);
     if (nullptr == _publish_context)
     {
@@ -30,7 +24,6 @@ bool Redis::connect()
         return false;
     }
 
-    // 负责subscribe订阅消息的上下文连接
     _subcribe_context = redisConnect("127.0.0.1", 6379);
     if (nullptr == _subcribe_context)
     {
@@ -38,20 +31,24 @@ bool Redis::connect()
         return false;
     }
 
-    // 在单独的线程中，监听通道上的事件，有消息给业务层进行上报
-    thread t([&]() {
+    // 超短超时：observer 不长期持有 _sub_mutex
+    // 10ms 内要么读到数据，要么让出锁给 subscribe/unsubscribe
+    struct timeval tv = {0, 10000}; // 10ms
+    redisSetTimeout(_subcribe_context, tv);
+
+    // 使用独立线程监听订阅消息
+    thread t([this]() {
         observer_channel_message();
     });
     t.detach();
 
     cout << "connect redis-server success!" << endl;
-
     return true;
 }
 
-// 向redis指定的通道channel发布消息
 bool Redis::publish(int channel, string message)
 {
+    lock_guard<mutex> lock(_pub_mutex);
     redisReply *reply = (redisReply *)redisCommand(_publish_context, "PUBLISH %d %s", channel, message.c_str());
     if (nullptr == reply)
     {
@@ -62,18 +59,14 @@ bool Redis::publish(int channel, string message)
     return true;
 }
 
-// 向redis指定的通道subscribe订阅消息
 bool Redis::subscribe(int channel)
 {
-    // SUBSCRIBE命令本身会造成线程阻塞等待通道里面发生消息，这里只做订阅通道，不接收通道消息
-    // 通道消息的接收专门在observer_channel_message函数中的独立线程中进行
-    // 只负责发送命令，不阻塞接收redis server响应消息，否则和notifyMsg线程抢占响应资源
+    lock_guard<mutex> lock(_sub_mutex);
     if (REDIS_ERR == redisAppendCommand(this->_subcribe_context, "SUBSCRIBE %d", channel))
     {
         cerr << "subscribe command failed!" << endl;
         return false;
     }
-    // redisBufferWrite可以循环发送缓冲区，直到缓冲区数据发送完毕（done被置为1）
     int done = 0;
     while (!done)
     {
@@ -83,20 +76,17 @@ bool Redis::subscribe(int channel)
             return false;
         }
     }
-    // redisGetReply
-
     return true;
 }
 
-// 向redis指定的通道unsubscribe取消订阅消息
 bool Redis::unsubscribe(int channel)
 {
+    lock_guard<mutex> lock(_sub_mutex);
     if (REDIS_ERR == redisAppendCommand(this->_subcribe_context, "UNSUBSCRIBE %d", channel))
     {
         cerr << "unsubscribe command failed!" << endl;
         return false;
     }
-    // redisBufferWrite可以循环发送缓冲区，直到缓冲区数据发送完毕（done被置为1）
     int done = 0;
     while (!done)
     {
@@ -109,26 +99,86 @@ bool Redis::unsubscribe(int channel)
     return true;
 }
 
-// 在独立线程中接收订阅通道中的消息
 void Redis::observer_channel_message()
 {
     redisReply *reply = nullptr;
-    while (REDIS_OK == redisGetReply(this->_subcribe_context, (void **)&reply))
+    while (true)
     {
-        // 订阅收到的消息是一个带三元素的数组
+        {
+            lock_guard<mutex> lock(_sub_mutex);
+            if (REDIS_OK != redisGetReply(this->_subcribe_context, (void **)&reply))
+            {
+                // 超时是正常的，清除错误标记避免后续 subscribe/publish 失败
+                // 只有连接真正断开时才退出
+                if (this->_subcribe_context->err == REDIS_ERR_EOF)
+                    break;
+                this->_subcribe_context->err = 0;  // 清除超时等可恢复错误
+                reply = nullptr;
+            }
+        }
         if (reply != nullptr && reply->element[2] != nullptr && reply->element[2]->str != nullptr)
         {
-            // 给业务层上报通道上发生的消息
-            _notify_message_handler(atoi(reply->element[1]->str) , reply->element[2]->str);
+            _notify_message_handler(atoi(reply->element[1]->str), reply->element[2]->str);
+            freeReplyObject(reply);
+            reply = nullptr;
         }
-
-        freeReplyObject(reply);
+        // 如果超时（reply==nullptr），短暂睡眠避免忙等
+        if (reply == nullptr)
+            this_thread::sleep_for(chrono::milliseconds(10));
     }
-
-    cerr << ">>>>>>>>>>>>> observer_channel_message quit <<<<<<<<<<<<<" << endl;
+    cerr << ">>>>>>>>>>>>>> observer_channel_message quit <<<<<<<<<<<<<<" << endl;
 }
 
-void Redis::init_notify_handler(function<void(int,string)> fn)
+void Redis::init_notify_handler(function<void(int, string)> fn)
 {
     this->_notify_message_handler = fn;
+}
+
+// ============================================================
+// 缓存方法 — Cache-Aside 模式
+// 所有 value 用 %b 二进制安全传递，避免 JSON 内特殊字符截断
+// ============================================================
+
+bool Redis::cacheSet(const string& key, const string& value, int ttl)
+{
+    lock_guard<mutex> lock(_pub_mutex);
+    redisReply *reply = (redisReply *)redisCommand(_publish_context,
+        "SETEX %s %d %s",
+        key.c_str(),
+        ttl,
+        value.c_str());
+    if (reply == nullptr)
+        return false;
+    freeReplyObject(reply);
+    return true;
+}
+
+string Redis::cacheGet(const string& key)
+{
+    lock_guard<mutex> lock(_pub_mutex);
+    redisReply *reply = (redisReply *)redisCommand(_publish_context,
+        "GET %s", key.c_str());
+    if (reply == nullptr)
+        return "";
+    string result;
+    if (reply->type == REDIS_REPLY_STRING)
+        result.assign(reply->str, reply->len);
+    freeReplyObject(reply);
+    return result;
+}
+
+bool Redis::cacheDel(const string& key)
+{
+    lock_guard<mutex> lock(_pub_mutex);
+    redisReply *reply = (redisReply *)redisCommand(_publish_context,
+        "DEL %s", key.c_str());
+    if (reply == nullptr)
+    {
+        cerr << "Redis::cacheDel command failed" << endl;
+        return false;
+    }
+    // DEL 返回删除的 key 数量
+    bool ok = (reply->type == REDIS_REPLY_INTEGER);
+    freeReplyObject(reply);
+    return ok;
 }

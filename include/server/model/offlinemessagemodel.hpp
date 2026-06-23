@@ -12,8 +12,11 @@ public:
     // 存储用户的离线信息
     void insert(int userid, string msg);
 
-    // 删除用户的离线消息
+    // 删除用户全部离线消息（登录时批量拉取后调用）
     void remove(int userid);
+
+    // 按 msg_uuid 删除单条消息（客户端 ACK 后调用）
+    void removeByMsgUuid(int userid, const string &msg_uuid);
 
     // 查询用户的离线消息
     vector<string> query(int userid);
